@@ -1,0 +1,678 @@
+# jscpd:ignore-start
+# See https://json.schemastore.org/github-workflow.json for vocabulary and rules
+name: CI
+
+env:
+  ASSET: dataplatform
+  TF_VER: 1.0.11
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  verify-terraform-configuration-layout:
+    runs-on: [ self-hosted, ubuntu, prod ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Verify terraform configuration layout for state and runtime
+        run: |
+          ./dataplatform/scripts/github_actions/verify-terraform-configuration-organisation.sh
+
+  terraform-fmt-validate-state:
+    runs-on: [ self-hosted, ubuntu, prod ]
+    steps:
+      - name: Configure terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${TF_VER}
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: terraform fmt check
+        run: terraform fmt --check --recursive dataplatform/google/state
+      - name: Confgure gcloud
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOY_DEV }}
+          export_default_credentials: true
+      - name: terraform validate
+        working-directory: dataplatform/google/state
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  terraform-fmt-validate-runtime:
+    runs-on: [ self-hosted, ubuntu, prod ]
+    steps:
+      - name: Configure terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${TF_VER}
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: terraform fmt check
+        run: terraform fmt --check --recursive dataplatform/google/runtime
+      - name: Configure gcloud
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOY_DEV }}
+          export_default_credentials: true
+      - name: terraform validate
+        working-directory: dataplatform/google/runtime
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  compute-pipeline-id:
+    name: Compute pipeline ID
+    runs-on: [ self-hosted, ubuntu, prod ]
+    outputs:
+      pipeline-id: ${{ steps.compute-pipeline-id.outputs.pipeline-id }}
+    steps:
+      - id: compute-pipeline-id
+        run: |
+          PREFIX=p$(printf "%08d" "$GITHUB_RUN_NUMBER")
+          echo PREFIX="$PREFIX"
+          echo "::set-output name=pipeline-id::$PREFIX"
+
+  super-lint:
+    name: Lint Code Base
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Run Super-Linter
+        uses: github/super-linter@v4
+        env:
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_PYTHON_ISORT: false
+          VALIDATE_DOCKERFILE: false
+          VALIDATE_DOCKERFILE_HADOLINT: false
+          # Filtering dataplatform/tests/features/CommonDataModel/1/environment.py becaus jscpd doesn't like symlinked files
+          # https://github.com/kucherenko/jscpd/issues/481
+          FILTER_REGEX_EXCLUDE: (docs|.devcontainer|.*gradlew|.*gradlew.bat|dataplatform/tests/features/CommonDataModel/1/environment.py) #try different combinations here if needed https://regex101.com/r/iOF1SP/1
+          VALIDATE_SQLFLUFF: false
+
+  images-build:
+    name: Base image build
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [
+      verify-terraform-configuration-layout,
+      compute-pipeline-id,
+      terraform-fmt-validate-state,
+      terraform-fmt-validate-runtime
+      ]
+    outputs:
+      dataplatform-image-name: ${{ steps.output-image-names-and-tags.outputs.dataplatform-image-name }}
+      dataplatform-image-tag: ${{ steps.output-image-names-and-tags.outputs.dataplatform-image-tag }}
+      dataplatform-image-name-and-tag: ${{ steps.output-image-names-and-tags.outputs.dataplatform-image-name-and-tag }}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Extract branch name
+        shell: bash
+        run: echo "BRANCH_SLUG=$(echo "${GITHUB_REF#refs/heads/}" | sed 's/\//_/g')" >> "$GITHUB_ENV"
+      - name: test BRANCH_SLUG
+        shell: bash
+        run: |
+          echo "${{ env.BRANCH_SLUG }}"
+          git branch --show-current
+      - name: "set shared variable"
+        run: |
+          GITHUB_REPOSITORY_LOWERCASE=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          {
+          echo "BASE_IMAGE_NAME=eu.gcr.io/msm-groupdata-admin-data-eng/${GITHUB_REPOSITORY_LOWERCASE}base"
+          echo "DATAPLATFORM_IMAGE_NAME=eu.gcr.io/msm-groupdata-admin-data-eng/${GITHUB_REPOSITORY_LOWERCASE}"
+          echo "DATAPLATFORM_ADMIN_IMAGE_NAME=eu.gcr.io/msm-groupdata-admin-data-eng/${GITHUB_REPOSITORY_LOWERCASE}-admin"
+          } >> "$GITHUB_ENV"
+
+      - name: "pull conda image"
+        run: |
+          docker pull ${{ env.IMAGE_NAME }}:conda_build || true
+      # Multistage image, we are pulling and building separately the conda section
+      # to have it cached for the complete build
+      - name: "conda image build"
+        run: |
+          DOCKER_BUILDKIT=1 docker build ./base_image \
+            --target conda_build \
+            --tag ${{ env.BASE_IMAGE_NAME }}:conda_build \
+            --cache-from=${{ env.BASE_IMAGE_NAME }}:conda_build \
+            --build-arg BUILDKIT_INLINE_CACHE=1
+      # Using Buildkit and multistage caching to speed up the build
+      # conda section is cached correctly, but the other section is not cached. Needs further investigation
+      # https://docs.docker.com/engine/reference/commandline/build/#specifying-external-cache-sources
+      - name: "base image build"
+        run: |
+          DOCKER_BUILDKIT=1 docker build ./base_image \
+            --tag ${{ env.BASE_IMAGE_NAME }}:"$GITHUB_SHA" \
+            --tag ${{ env.BASE_IMAGE_NAME }}:${{ env.BRANCH_SLUG }} \
+            --cache-from=${{ env.BASE_IMAGE_NAME }}:conda_build \
+            --build-arg BUILDKIT_INLINE_CACHE=1
+      - name: "push conda image"
+        run: docker push ${{ env.BASE_IMAGE_NAME }}:conda_build
+      - id: base-image-push
+        name: "push images"
+        run: |
+          docker push ${{ env.BASE_IMAGE_NAME }}:"$GITHUB_SHA"
+          docker push ${{ env.BASE_IMAGE_NAME }}:${{ env.BRANCH_SLUG }}
+
+      - id: dataplatform-image-build
+        name: "dataplatform image build"
+        run: |
+          DOCKER_BUILDKIT=1 docker build ./dataplatform \
+            --build-arg FROM_TAG="${GITHUB_SHA}" \
+            --build-arg FROM_REGISTRY_AND_NAMESPACE="${BASE_IMAGE_NAME}" \
+            --tag "${DATAPLATFORM_IMAGE_NAME}":"$GITHUB_SHA" \
+            --tag "${DATAPLATFORM_IMAGE_NAME}":${{ env.BRANCH_SLUG }}
+      - id: dataplatform-image-push
+        name: "dataplatform image push"
+        run: |
+          docker push ${{ env.DATAPLATFORM_IMAGE_NAME }}:"$GITHUB_SHA"
+          docker push ${{ env.DATAPLATFORM_IMAGE_NAME }}:${{ env.BRANCH_SLUG }}
+
+      - id: output-image-names-and-tags
+        name: "Output image names and tags"
+        run: |
+          echo "::set-output name=dataplatform-image-name::${{ env.DATAPLATFORM_IMAGE_NAME }}"
+          echo "::set-output name=dataplatform-image-tag::$GITHUB_SHA"
+          echo "::set-output name=dataplatform-image-name-and-tag::${{ env.DATAPLATFORM_IMAGE_NAME }}:$GITHUB_SHA"
+  sqlfluff:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [images-build]
+    env:
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: sqlfluff lint
+        run: |
+          # Keep the exclude rules in sync with those defined in .pre-commit-config.yaml
+          source ./scripts/github_actions/ci_job_config.sh
+          msglog "${CYAN}BEGIN: ${YELLOW}SQLFluff linting"
+          invoke lint.sql -e L016 -e L031 -e L014
+          msglog "${CYAN}FINISH: ${YELLOW}SQLFluff linting"
+
+  echo-image-build-outputs:
+    runs-on: [ self-hosted, ubuntu, prod ]
+    needs: [images-build]
+    steps:
+      - name: echo outputs from image build
+        shell: bash
+        run: |
+          source ./dataplatform/scripts/global_functions.sh
+          msglog "${YELLOW}dataplatform-image-name=${{ needs.images-build.outputs.dataplatform-image-name }}"
+          msglog "${YELLOW}dataplatform-image-tag=${{ needs.images-build.outputs.dataplatform-image-tag }}"
+          msglog "${YELLOW}dataplatform-image-name-and-tag=${{ needs.images-build.outputs.dataplatform-image-name-and-tag }}"
+
+  unit-tests:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [compute-pipeline-id, images-build]
+    env:
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    strategy:
+      matrix:
+        testName: [
+          post-to-braze, get-braze-delta, braze-currents,
+          braze-currents-backfill, json-translator, schema-applier,
+          record-all-schema, regulatory-compliance
+        ]
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - run: |
+          source ./scripts/github_actions/ci_job_config.sh
+          invoke dataplatform.runtime.test.${{ matrix.testName }} --junit-xml /tmp/pytest.xml
+        name: "run tests"
+      - name: Upload Unit Test Results
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: Unit Test Results (Python ${{ matrix.testName }})
+          path: /tmp/pytest.xml
+
+  publish-unit-test-results:
+    name: "Publish Unit Tests Results"
+    needs: unit-tests
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    if: always()
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          path: artifacts
+
+      - name: Publish Unit Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v1
+        with:
+          files: artifacts/**/pytest.xml
+
+# Deploy and Destroy dataplatform - Dev
+  dataplatform_deploy_dev:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [compute-pipeline-id, images-build, unit-tests, super-lint]
+    environment:
+      name: dev
+    env:
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Configure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Install gcloud alpha
+        run: |
+          gcloud components install alpha --quiet
+        # gcloud alpha is used in a script that is executed during runtime deployment.
+        # This script uses `gcloud alpha bq tables list`
+        # If this graduates out of alpha then we should remove this step
+      - name: deploy
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          invoke dataplatform.deploy --auto-approve
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+
+  integration-tests:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [compute-pipeline-id, images-build, dataplatform_deploy_dev]
+    environment:
+      name: dev
+    env:
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    strategy:
+      matrix:
+        testName: [
+            common-data-model-0, common-data-model-1, braze-currents-ingress,
+            braze-mart-and-egress, json-schema-translator-end-to-end,
+            schema-applier-svc, event-service, rtbf-metadata-population,
+            data-quality-monitoring
+        ]
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Output date and time
+        id: outputTime
+        run: date +"%Y-%m-%d %H:%M:%S"
+      - run: |
+          source ./scripts/github_actions/ci_job_config.sh
+          msglog "${CYAN}BEGIN: ${YELLOW}Integration Test ${YELLOW}${{ matrix.testName }}"
+          invoke dataplatform.integration-tests.${{ matrix.testName }} --junit-directory /tmp/behavetest
+          msglog "${CYAN}END: ${YELLOW}Integration Test ${YELLOW}${{ matrix.testName }}"
+        name: runtest
+        id: runtest
+      - name: Upload Integration Test Results
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: Integration Test Results (Python ${{ matrix.testName }})
+          path: /tmp/behavetest/*.xml
+      - name: Delay destroy to enable investigations if necessary
+        if: always() && steps.runtest.outcome == 'failure'
+        run: |
+          echo "Sleep to allow someone to investigate any problems"
+          echo "that might arise in the deployment."
+          echo "30 mins should leave enough time for someone to"
+          echo "hit cancel on the workflow should they need to investigate"
+          echo "Please run the destroy manually after carrying out your"
+          echo "investigations"
+          echo "useful reference: https://github.community/t/run-step-based-on-which-previous-step-failed/18292"
+          sleep 1800
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+  publish-integration-test-results:
+    name: "Publish Integration Tests Results"
+    needs: integration-tests
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    if: always()
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          path: artifacts
+
+      - name: Publish Integration Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v1
+        with:
+          files: artifacts/**/TESTS-*.xml
+          check_name: Integration Test Results
+
+  dataplatform_destroy_dev:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    if: always()
+    environment:
+      name: dev
+    needs: [ compute-pipeline-id, images-build, integration-tests,dev_post_deploy_admin_tasks ]
+    env:
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Install gcloud alpha
+        run: |
+          gcloud components install alpha --quiet
+        # gcloud alpha is used in a script that is executed during runtime deployment.
+        # This script uses `gcloud alpha bq tables list`
+        # If this graduates out of alpha then we should remove this step
+      - name: destroy
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          invoke dataplatform.destroy --auto-approve --force-destroy || invoke dataplatform.destroy --auto-approve --force-destroy # crude retry
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+  cleanup:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    if: always()
+    needs: [ compute-pipeline-id, images-build, dataplatform_destroy_dev ]
+    env:
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+      ENVIRONMENT: dev
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOY_DEV }}
+          export_default_credentials: true
+      - name: cleanup
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          invoke dataplatform.cleanup
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+  dataplatform_deploy_preprod:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [images-build, dev_post_deploy_admin_tasks]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: prod
+    concurrency: preprod_deployment
+    env:
+      PREFIX: preprod
+      PREFIX_DIR: preprod
+      ENVIRONMENT: prod
+      DO_DEPLOY: ${{ secrets.DO_DEPLOY }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Configure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Install gcloud alpha
+        run: |
+          gcloud components install alpha --quiet
+        # gcloud alpha is used in a script that is executed during runtime deployment.
+        # This script uses `gcloud alpha bq tables list`
+        # If this graduates out of alpha then we should remove this step
+      - name: deploy
+        run: |
+          if [ "$DO_DEPLOY" == "yes" ]
+          then
+            export ASSET_VERSION=${GITHUB_SHA}
+            source ./scripts/github_actions/ci_job_config.sh
+            invoke dataplatform.deploy --auto-approve
+          else
+            source ./scripts/global_functions.sh
+            msglog "${RED}Deployments have been turned off"
+          fi
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+  dataplatform_deploy_prod:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [images-build,  preprod_post_deploy_admin_tasks]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: prod
+    concurrency: prod_deployment
+    env:
+      PREFIX: prod
+      PREFIX_DIR: prod
+      ENVIRONMENT: prod
+      DO_DEPLOY: ${{ secrets.DO_DEPLOY }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Configure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Install gcloud alpha
+        run: |
+          gcloud components install alpha --quiet
+        # gcloud alpha is used in a script that is executed during runtime deployment.
+        # This script uses `gcloud alpha bq tables list`
+        # If this graduates out of alpha then we should remove this step
+      - name: deploy
+        run: |
+          if [ "$DO_DEPLOY" == "yes" ]
+          then
+            export ASSET_VERSION=${GITHUB_SHA}
+            source ./scripts/github_actions/ci_job_config.sh
+            invoke dataplatform.deploy --auto-approve
+          else
+            source ./scripts/global_functions.sh
+            msglog "${RED}Deployments have been turned off"
+          fi
+      - id: remove-service-account-credentials
+        name: "Remove service account credentials"
+        if: always()
+        run: |
+          rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          gcloud auth revoke "$(gcloud config get-value account)"
+
+  dev_post_deploy_admin_tasks:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [images-build, compute-pipeline-id, integration-tests]
+    environment:
+      name: dev
+    env:
+      ENVIRONMENT: dev
+      PREFIX: ${{needs.compute-pipeline-id.outputs.pipeline-id}}
+      PREFIX_DIR: ci
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    strategy:
+      matrix:
+        adminTaskName: [dummy-task]
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Post deploy admin task
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          msglog "${CYAN}BEGIN POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+          invoke dataplatform.admin.${{ matrix.adminTaskName }} --prefix="${PREFIX}"
+          msglog "${CYAN}FINISH POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+
+  preprod_post_deploy_admin_tasks:
+    runs-on: [ self-hosted, ubuntu, dataplatform ]
+    needs: [images-build, compute-pipeline-id, dataplatform_deploy_preprod ]
+    environment:
+      name: prod
+    env:
+      ENVIRONMENT: prod
+      PREFIX: preprod
+      PREFIX_DIR: preprod
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    strategy:
+      matrix:
+        adminTaskName: [dummy-task]
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Post deploy admin task
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          msglog "${CYAN}BEGIN POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+          invoke dataplatform.admin.${{ matrix.adminTaskName }} --prefix="${PREFIX}"
+          msglog "${CYAN}FINISH POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+  prod_post_deploy_admin_tasks:
+    runs-on: [ self-hosted, ubuntu, dataplatform]
+    needs: [images-build, compute-pipeline-id, dataplatform_deploy_prod ]
+    environment:
+      name: prod
+    env:
+      ENVIRONMENT: prod
+      PREFIX: prod
+      PREFIX_DIR: prod
+    defaults:
+      run:
+        shell: bash
+        working-directory: /dataplatform
+    container:
+      image: ${{needs.images-build.outputs.dataplatform-image-name-and-tag}}
+    strategy:
+      matrix:
+        adminTaskName: [dummy-task]
+    steps:
+      - name: "Build:checkout"
+        uses: actions/checkout@v2
+      - name: Confgure gcloud CLI
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_key: ${{ secrets.DEPLOYER_SA_JSON_KEY }}
+          export_default_credentials: true
+      - name: Post deploy admin task
+        run: |
+          export ASSET_VERSION=${GITHUB_SHA}
+          source ./scripts/github_actions/ci_job_config.sh
+          msglog "${CYAN}BEGIN POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+          invoke dataplatform.admin.${{ matrix.adminTaskName }} --prefix="${PREFIX}"
+          msglog "${CYAN}FINISH POST DEPLOY ADMIN TASK: ${YELLOW}${{ matrix.adminTaskName }}\t${YELLOW}${ENVIRONMENT}\t${PREFIX}"
+# jscpd:ignore-end
