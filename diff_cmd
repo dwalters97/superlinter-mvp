@@ -1,0 +1,2 @@
+# Get git diff'd files
+git -C "${WORKSPACE_PATH}" diff --name-only | xargs -I % sh -c "echo ${WORKSPACE_PATH}/%" 2>&1
